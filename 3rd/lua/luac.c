@@ -1,16 +1,19 @@
 /*
-** $Id: luac.c,v 1.69 2011/11/29 17:46:33 lhf Exp $
-** Lua compiler (saves bytecodes to files; also list bytecodes)
+** $Id: luac.c,v 1.76 2018/06/19 01:32:02 lhf Exp $
+** Lua compiler (saves bytecodes to files; also lists bytecodes)
 ** See Copyright Notice in lua.h
 */
 
+#define luac_c
+#define LUA_CORE
+
+#include "lprefix.h"
+
+#include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#define luac_c
-#define LUA_CORE
 
 #include "lua.h"
 #include "lauxlib.h"
@@ -47,14 +50,14 @@ static void cannot(const char* what)
 static void usage(const char* message)
 {
  if (*message=='-')
-  fprintf(stderr,"%s: unrecognized option " LUA_QS "\n",progname,message);
+  fprintf(stderr,"%s: unrecognized option '%s'\n",progname,message);
  else
   fprintf(stderr,"%s: %s\n",progname,message);
  fprintf(stderr,
   "usage: %s [options] [filenames]\n"
   "Available options are:\n"
   "  -l       list (use -l -l for full listing)\n"
-  "  -o name  output to file " LUA_QL("name") " (default is \"%s\")\n"
+  "  -o name  output to file 'name' (default is \"%s\")\n"
   "  -p       parse only\n"
   "  -s       strip debug information\n"
   "  -v       show version information\n"
@@ -89,7 +92,7 @@ static int doargs(int argc, char* argv[])
   {
    output=argv[++i];
    if (output==NULL || *output==0 || (*output=='-' && output[1]!=0))
-    usage(LUA_QL("-o") " needs argument");
+    usage("'-o' needs argument");
    if (IS("-")) output=NULL;
   }
   else if (IS("-p"))			/* parse only */
@@ -146,9 +149,9 @@ static const Proto* combine(lua_State* L, int n)
   for (i=0; i<n; i++)
   {
    f->p[i]=toproto(L,i-n-1);
-   if (f->p[i]->sp->sizeupvalues>0) f->p[i]->sp->upvalues[0].instack=0;
+   if (f->p[i]->sizeupvalues>0) f->p[i]->upvalues[0].instack=0;
   }
-  f->sp->sizelineinfo=0;
+  f->sizelineinfo=0;
   return f;
  }
 }
@@ -203,7 +206,7 @@ int main(int argc, char* argv[])
 }
 
 /*
-** $Id: print.c,v 1.69 2013/07/04 01:03:46 lhf Exp $
+** $Id: luac.c,v 1.76 2018/06/19 01:32:02 lhf Exp $
 ** print bytecodes
 ** See Copyright Notice in lua.h
 */
@@ -223,7 +226,7 @@ int main(int argc, char* argv[])
 static void PrintString(const TString* ts)
 {
  const char* s=getstr(ts);
- size_t i,n=ts->tsv.len;
+ size_t i,n=tsslen(ts);
  printf("%c",'"');
  for (i=0; i<n; i++)
  {
@@ -251,7 +254,7 @@ static void PrintString(const TString* ts)
 static void PrintConstant(const Proto* f, int i)
 {
  const TValue* o=&f->k[i];
- switch (ttypenv(o))
+ switch (ttype(o))
  {
   case LUA_TNIL:
 	printf("nil");
@@ -259,11 +262,19 @@ static void PrintConstant(const Proto* f, int i)
   case LUA_TBOOLEAN:
 	printf(bvalue(o) ? "true" : "false");
 	break;
-  case LUA_TNUMBER:
-	printf(LUA_NUMBER_FMT,nvalue(o));
+  case LUA_TNUMFLT:
+	{
+	char buff[100];
+	sprintf(buff,LUA_NUMBER_FMT,fltvalue(o));
+	printf("%s",buff);
+	if (buff[strspn(buff,"-0123456789")]=='\0') printf(".0");
 	break;
-  case LUA_TSTRING:
-	PrintString(rawtsvalue(o));
+	}
+  case LUA_TNUMINT:
+	printf(LUA_INTEGER_FMT,ivalue(o));
+	break;
+  case LUA_TSHRSTR: case LUA_TLNGSTR:
+	PrintString(tsvalue(o));
 	break;
   default:				/* cannot happen */
 	printf("? type=%d",ttype(o));
@@ -271,14 +282,13 @@ static void PrintConstant(const Proto* f, int i)
  }
 }
 
-#define UPVALNAME(x) ((f->sp->upvalues[x].name) ? getstr(f->sp->upvalues[x].name) : "-")
+#define UPVALNAME(x) ((f->upvalues[x].name) ? getstr(f->upvalues[x].name) : "-")
 #define MYK(x)		(-1-(x))
 
 static void PrintCode(const Proto* f)
 {
- const SharedProto *sp = f->sp;
- const Instruction* code=sp->code;
- int pc,n=sp->sizecode;
+ const Instruction* code=f->code;
+ int pc,n=f->sizecode;
  for (pc=0; pc<n; pc++)
  {
   Instruction i=code[pc];
@@ -338,8 +348,15 @@ static void PrintCode(const Proto* f)
    case OP_ADD:
    case OP_SUB:
    case OP_MUL:
-   case OP_DIV:
+   case OP_MOD:
    case OP_POW:
+   case OP_DIV:
+   case OP_IDIV:
+   case OP_BAND:
+   case OP_BOR:
+   case OP_BXOR:
+   case OP_SHL:
+   case OP_SHR:
    case OP_EQ:
    case OP_LT:
    case OP_LE:
@@ -376,7 +393,7 @@ static void PrintCode(const Proto* f)
 #define SS(x)	((x==1)?"":"s")
 #define S(x)	(int)(x),SS(x)
 
-static void PrintHeader(const SharedProto* f)
+static void PrintHeader(const Proto* f)
 {
  const char* s=f->source ? getstr(f->source) : "=?";
  if (*s=='@' || *s=='=')
@@ -398,9 +415,8 @@ static void PrintHeader(const SharedProto* f)
 
 static void PrintDebug(const Proto* f)
 {
- const SharedProto *sp = f->sp;
  int i,n;
- n=sp->sizek;
+ n=f->sizek;
  printf("constants (%d) for %p:\n",n,VOID(f));
  for (i=0; i<n; i++)
  {
@@ -408,26 +424,26 @@ static void PrintDebug(const Proto* f)
   PrintConstant(f,i);
   printf("\n");
  }
- n=sp->sizelocvars;
+ n=f->sizelocvars;
  printf("locals (%d) for %p:\n",n,VOID(f));
  for (i=0; i<n; i++)
  {
   printf("\t%d\t%s\t%d\t%d\n",
-  i,getstr(sp->locvars[i].varname),sp->locvars[i].startpc+1,sp->locvars[i].endpc+1);
+  i,getstr(f->locvars[i].varname),f->locvars[i].startpc+1,f->locvars[i].endpc+1);
  }
- n=sp->sizeupvalues;
+ n=f->sizeupvalues;
  printf("upvalues (%d) for %p:\n",n,VOID(f));
  for (i=0; i<n; i++)
  {
   printf("\t%d\t%s\t%d\t%d\n",
-  i,UPVALNAME(i),sp->upvalues[i].instack,sp->upvalues[i].idx);
+  i,UPVALNAME(i),f->upvalues[i].instack,f->upvalues[i].idx);
  }
 }
 
 static void PrintFunction(const Proto* f, int full)
 {
- int i,n=f->sp->sizep;
- PrintHeader(f->sp);
+ int i,n=f->sizep;
+ PrintHeader(f);
  PrintCode(f);
  if (full) PrintDebug(f);
  for (i=0; i<n; i++) PrintFunction(f->p[i],full);

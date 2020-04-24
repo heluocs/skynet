@@ -1,3 +1,5 @@
+#define LUA_LIB
+
 #include "skynet_malloc.h"
 
 #include <stdlib.h>
@@ -8,6 +10,9 @@
 
 #include <lua.h>
 #include <lauxlib.h>
+
+#include <sys/socket.h>
+#include <arpa/inet.h>
 
 #include "skynet_socket.h"
 
@@ -80,6 +85,15 @@ lnewbuffer(lua_State *L) {
 	int size
 
 	return size
+
+	Comment: The table pool record all the buffers chunk, 
+	and the first index [1] is a lightuserdata : free_node. We can always use this pointer for struct buffer_node .
+	The following ([2] ...)  userdatas in table pool is the buffer chunk (for struct buffer_node), 
+	we never free them until the VM closed. The size of first chunk ([2]) is 16 struct buffer_node,
+	and the second size is 32 ... The largest size of chunk is LARGE_PAGE_NODE (4096)
+
+	lpushbbuffer will get a free struct buffer_node from table pool, and then put the msg/size in it.
+	lpopbuffer return the struct buffer_node back to table pool (By calling return_free_node).
  */
 static int
 lpushbuffer(lua_State *L) {
@@ -178,7 +192,10 @@ pop_lstring(lua_State *L, struct socket_buffer *sb, int sz, int skip) {
 			}
 			break;
 		}
-		luaL_addlstring(&b, current->msg + sb->offset, (sz - skip < bytes) ? sz - skip : bytes);
+		int real_sz = sz - skip;
+		if (real_sz > 0) {
+			luaL_addlstring(&b, current->msg + sb->offset, (real_sz < bytes) ? real_sz : bytes);
+		}
 		return_free_node(L,2,sb);
 		sz-=bytes;
 		if (sz==0)
@@ -203,7 +220,7 @@ lheader(lua_State *L) {
 		sz |= s[i];
 	}
 
-	lua_pushunsigned(L, sz);
+	lua_pushinteger(L, (lua_Integer)sz);
 
 	return 1;
 }
@@ -240,6 +257,9 @@ static int
 lclearbuffer(lua_State *L) {
 	struct socket_buffer * sb = lua_touserdata(L, 1);
 	if (sb == NULL) {
+		if (lua_isnil(L, 1)) {
+			return 0;
+		}
 		return luaL_error(L, "Need buffer object at param 1");
 	}
 	luaL_checktype(L,2,LUA_TTABLE);
@@ -372,7 +392,53 @@ lunpack(lua_State *L) {
 	} else {
 		lua_pushlightuserdata(L, message->buffer);
 	}
+	if (message->type == SKYNET_SOCKET_TYPE_UDP) {
+		int addrsz = 0;
+		const char * addrstring = skynet_socket_udp_address(message, &addrsz);
+		if (addrstring) {
+			lua_pushlstring(L, addrstring, addrsz);
+			return 5;
+		}
+	}
 	return 4;
+}
+
+static const char *
+address_port(lua_State *L, char *tmp, const char * addr, int port_index, int *port) {
+	const char * host;
+	if (lua_isnoneornil(L,port_index)) {
+		host = strchr(addr, '[');
+		if (host) {
+			// is ipv6
+			++host;
+			const char * sep = strchr(addr,']');
+			if (sep == NULL) {
+				luaL_error(L, "Invalid address %s.",addr);
+			}
+			memcpy(tmp, host, sep-host);
+			tmp[sep-host] = '\0';
+			host = tmp;
+			sep = strchr(sep + 1, ':');
+			if (sep == NULL) {
+				luaL_error(L, "Invalid address %s.",addr);
+			}
+			*port = strtoul(sep+1,NULL,10);
+		} else {
+			// is ipv4
+			const char * sep = strchr(addr,':');
+			if (sep == NULL) {
+				luaL_error(L, "Invalid address %s.",addr);
+			}
+			memcpy(tmp, addr, sep-addr);
+			tmp[sep-addr] = '\0';
+			host = tmp;
+			*port = strtoul(sep+1,NULL,10);
+		}
+	} else {
+		host = addr;
+		*port = luaL_optinteger(L,port_index, 0);
+	}
+	return host;
 }
 
 static int
@@ -380,20 +446,10 @@ lconnect(lua_State *L) {
 	size_t sz = 0;
 	const char * addr = luaL_checklstring(L,1,&sz);
 	char tmp[sz];
-	int port;
-	const char * host;
-	if (lua_isnoneornil(L,2)) {
-		const char * sep = strchr(addr,':');
-		if (sep == NULL) {
-			return luaL_error(L, "Connect to invalid address %s.",addr);
-		}
-		memcpy(tmp, addr, sep-addr);
-		tmp[sep-addr] = '\0';
-		host = tmp;
-		port = strtoul(sep+1,NULL,10);
-	} else {
-		host = addr;
-		port = luaL_checkinteger(L,2);
+	int port = 0;
+	const char * host = address_port(L, tmp, addr, 2, &port);
+	if (port == 0) {
+		return luaL_error(L, "Invalid port");
 	}
 	struct skynet_context * ctx = lua_touserdata(L, lua_upvalueindex(1));
 	int id = skynet_socket_connect(ctx, host, port);
@@ -407,6 +463,14 @@ lclose(lua_State *L) {
 	int id = luaL_checkinteger(L,1);
 	struct skynet_context * ctx = lua_touserdata(L, lua_upvalueindex(1));
 	skynet_socket_close(ctx, id);
+	return 0;
+}
+
+static int
+lshutdown(lua_State *L) {
+	int id = luaL_checkinteger(L,1);
+	struct skynet_context * ctx = lua_touserdata(L, lua_upvalueindex(1));
+	skynet_socket_shutdown(ctx, id);
 	return 0;
 }
 
@@ -425,29 +489,95 @@ llisten(lua_State *L) {
 	return 1;
 }
 
-static void *
-get_buffer(lua_State *L, int *sz) {
-	void *buffer;
-	if (lua_isuserdata(L,2)) {
-		buffer = lua_touserdata(L,2);
-		*sz = luaL_checkinteger(L,3);
-	} else {
-		size_t len = 0;
-		const char * str =  luaL_checklstring(L, 2, &len);
-		buffer = skynet_malloc(len);
-		memcpy(buffer, str, len);
-		*sz = (int)len;
+static size_t
+count_size(lua_State *L, int index) {
+	size_t tlen = 0;
+	int i;
+	for (i=1;lua_geti(L, index, i) != LUA_TNIL; ++i) {
+		size_t len;
+		luaL_checklstring(L, -1, &len);
+		tlen += len;
+		lua_pop(L,1);
 	}
-	return buffer;
+	lua_pop(L,1);
+	return tlen;
+}
+
+static void
+concat_table(lua_State *L, int index, void *buffer, size_t tlen) {
+	char *ptr = buffer;
+	int i;
+	for (i=1;lua_geti(L, index, i) != LUA_TNIL; ++i) {
+		size_t len;
+		const char * str = lua_tolstring(L, -1, &len);
+		if (str == NULL || tlen < len) {
+			break;
+		}
+		memcpy(ptr, str, len);
+		ptr += len;
+		tlen -= len;
+		lua_pop(L,1);
+	}
+	if (tlen != 0) {
+		skynet_free(buffer);
+		luaL_error(L, "Invalid strings table");
+	}
+	lua_pop(L,1);
+}
+
+static void
+get_buffer(lua_State *L, int index, struct socket_sendbuffer *buf) {
+	void *buffer;
+	switch(lua_type(L, index)) {
+		size_t len;
+	case LUA_TUSERDATA:
+		// lua full useobject must be a raw pointer, it can't be a socket object or a memory object.
+		buf->type = SOCKET_BUFFER_RAWPOINTER;
+		buf->buffer = lua_touserdata(L, index);
+		if (lua_isinteger(L, index+1)) {
+			buf->sz = lua_tointeger(L, index+1);
+		} else {
+			buf->sz = lua_rawlen(L, index);
+		}
+		break;
+	case LUA_TLIGHTUSERDATA: {
+		int sz = -1;
+		if (lua_isinteger(L, index+1)) {
+			sz = lua_tointeger(L,index+1);
+		}
+		if (sz < 0) {
+			buf->type = SOCKET_BUFFER_OBJECT;
+		} else {
+			buf->type = SOCKET_BUFFER_MEMORY;
+		}
+		buf->buffer = lua_touserdata(L,index);
+		buf->sz = (size_t)sz;
+		break;
+		}
+	case LUA_TTABLE:
+		// concat the table as a string
+		len = count_size(L, index);
+		buffer = skynet_malloc(len);
+		concat_table(L, index, buffer, len);
+		buf->type = SOCKET_BUFFER_MEMORY;
+		buf->buffer = buffer;
+		buf->sz = len;
+		break;
+	default:
+		buf->type = SOCKET_BUFFER_RAWPOINTER;
+		buf->buffer = luaL_checklstring(L, index, &buf->sz);
+		break;
+	}
 }
 
 static int
 lsend(lua_State *L) {
 	struct skynet_context * ctx = lua_touserdata(L, lua_upvalueindex(1));
 	int id = luaL_checkinteger(L, 1);
-	int sz = 0;
-	void *buffer = get_buffer(L, &sz);
-	int err = skynet_socket_send(ctx, id, buffer, sz);
+	struct socket_sendbuffer buf;
+	buf.id = id;
+	get_buffer(L, 2, &buf);
+	int err = skynet_socket_sendbuffer(ctx, &buf);
 	lua_pushboolean(L, !err);
 	return 1;
 }
@@ -456,10 +586,12 @@ static int
 lsendlow(lua_State *L) {
 	struct skynet_context * ctx = lua_touserdata(L, lua_upvalueindex(1));
 	int id = luaL_checkinteger(L, 1);
-	int sz = 0;
-	void *buffer = get_buffer(L, &sz);
-	skynet_socket_send_lowpriority(ctx, id, buffer, sz);
-	return 0;
+	struct socket_sendbuffer buf;
+	buf.id = id;
+	get_buffer(L, 2, &buf);
+	int err = skynet_socket_sendbuffer_lowpriority(ctx, &buf);
+	lua_pushboolean(L, !err);
+	return 1;
 }
 
 static int
@@ -487,8 +619,155 @@ lnodelay(lua_State *L) {
 	return 0;
 }
 
-int
-luaopen_socketdriver(lua_State *L) {
+static int
+ludp(lua_State *L) {
+	struct skynet_context * ctx = lua_touserdata(L, lua_upvalueindex(1));
+	size_t sz = 0;
+	const char * addr = lua_tolstring(L,1,&sz);
+	char tmp[sz];
+	int port = 0;
+	const char * host = NULL;
+	if (addr) {
+		host = address_port(L, tmp, addr, 2, &port);
+	}
+
+	int id = skynet_socket_udp(ctx, host, port);
+	if (id < 0) {
+		return luaL_error(L, "udp init failed");
+	}
+	lua_pushinteger(L, id);
+	return 1;
+}
+
+static int
+ludp_connect(lua_State *L) {
+	struct skynet_context * ctx = lua_touserdata(L, lua_upvalueindex(1));
+	int id = luaL_checkinteger(L, 1);
+	size_t sz = 0;
+	const char * addr = luaL_checklstring(L,2,&sz);
+	char tmp[sz];
+	int port = 0;
+	const char * host = NULL;
+	if (addr) {
+		host = address_port(L, tmp, addr, 3, &port);
+	}
+
+	if (skynet_socket_udp_connect(ctx, id, host, port)) {
+		return luaL_error(L, "udp connect failed");
+	}
+
+	return 0;
+}
+
+static int
+ludp_send(lua_State *L) {
+	struct skynet_context * ctx = lua_touserdata(L, lua_upvalueindex(1));
+	int id = luaL_checkinteger(L, 1);
+	const char * address = luaL_checkstring(L, 2);
+	struct socket_sendbuffer buf;
+	buf.id = id;
+	get_buffer(L, 3, &buf);
+	int err = skynet_socket_udp_sendbuffer(ctx, address, &buf);
+
+	lua_pushboolean(L, !err);
+
+	return 1;
+}
+
+static int
+ludp_address(lua_State *L) {
+	size_t sz = 0;
+	const uint8_t * addr = (const uint8_t *)luaL_checklstring(L, 1, &sz);
+	uint16_t port = 0;
+	memcpy(&port, addr+1, sizeof(uint16_t));
+	port = ntohs(port);
+	const void * src = addr+3;
+	char tmp[256];
+	int family;
+	if (sz == 1+2+4) {
+		family = AF_INET;
+	} else {
+		if (sz != 1+2+16) {
+			return luaL_error(L, "Invalid udp address");
+		}
+		family = AF_INET6;
+	}
+	if (inet_ntop(family, src, tmp, sizeof(tmp)) == NULL) {
+		return luaL_error(L, "Invalid udp address");
+	}
+	lua_pushstring(L, tmp);
+	lua_pushinteger(L, port);
+	return 2;
+}
+
+static void
+getinfo(lua_State *L, struct socket_info *si) {
+	lua_newtable(L);
+	lua_pushinteger(L, si->id);
+	lua_setfield(L, -2, "id");
+	lua_pushinteger(L, si->opaque);
+	lua_setfield(L, -2, "address");
+	switch(si->type) {
+	case SOCKET_INFO_LISTEN:
+		lua_pushstring(L, "LISTEN");
+		lua_setfield(L, -2, "type");
+		lua_pushinteger(L, si->read);
+		lua_setfield(L, -2, "accept");
+		lua_pushinteger(L, si->rtime);
+		lua_setfield(L, -2, "rtime");
+		if (si->name[0]) {
+			lua_pushstring(L, si->name);
+			lua_setfield(L, -2, "sock");
+		}
+		return;
+	case SOCKET_INFO_TCP:
+		lua_pushstring(L, "TCP");
+		break;
+	case SOCKET_INFO_UDP:
+		lua_pushstring(L, "UDP");
+		break;
+	case SOCKET_INFO_BIND:
+		lua_pushstring(L, "BIND");
+		break;
+	default:
+		lua_pushstring(L, "UNKNOWN");
+		lua_setfield(L, -2, "type");
+		return;
+	}
+	lua_setfield(L, -2, "type");
+	lua_pushinteger(L, si->read);
+	lua_setfield(L, -2, "read");
+	lua_pushinteger(L, si->write);
+	lua_setfield(L, -2, "write");
+	lua_pushinteger(L, si->wbuffer);
+	lua_setfield(L, -2, "wbuffer");
+	lua_pushinteger(L, si->rtime);
+	lua_setfield(L, -2, "rtime");
+	lua_pushinteger(L, si->wtime);
+	lua_setfield(L, -2, "wtime");
+	if (si->name[0]) {
+		lua_pushstring(L, si->name);
+		lua_setfield(L, -2, "peer");
+	}
+}
+
+static int
+linfo(lua_State *L) {
+	lua_newtable(L);
+	struct socket_info * si = skynet_socket_info();
+	struct socket_info * temp = si;
+	int n = 0;
+	while (temp) {
+		getinfo(L, temp);
+		lua_seti(L, -2, ++n);
+		temp = temp->next;
+	}
+	socket_info_release(si);
+	return 1;
+}
+
+LUAMOD_API int
+luaopen_skynet_socketdriver(lua_State *L) {
 	luaL_checkversion(L);
 	luaL_Reg l[] = {
 		{ "buffer", lnewbuffer },
@@ -500,6 +779,7 @@ luaopen_socketdriver(lua_State *L) {
 		{ "readline", lreadline },
 		{ "str2p", lstr2p },
 		{ "header", lheader },
+		{ "info", linfo },
 
 		{ "unpack", lunpack },
 		{ NULL, NULL },
@@ -508,12 +788,17 @@ luaopen_socketdriver(lua_State *L) {
 	luaL_Reg l2[] = {
 		{ "connect", lconnect },
 		{ "close", lclose },
+		{ "shutdown", lshutdown },
 		{ "listen", llisten },
 		{ "send", lsend },
 		{ "lsend", lsendlow },
 		{ "bind", lbind },
 		{ "start", lstart },
 		{ "nodelay", lnodelay },
+		{ "udp", ludp },
+		{ "udp_connect", ludp_connect },
+		{ "udp_send", ludp_send },
+		{ "udp_address", ludp_address },
 		{ NULL, NULL },
 	};
 	lua_getfield(L, LUA_REGISTRYINDEX, "skynet_context");
